@@ -7,18 +7,30 @@
 <style>
 html, body {
   margin: 0;
-  height: 100%;
+  padding: 0;
   background: black;
-}
-
-#root {
-  display: flex;
-  flex-direction: column;
+  overflow: hidden;
   height: 100%;
 }
 
-#screen-wrap {
-  flex: 1;
+#ui {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  display: flex;
+  gap: 8px;
+  z-index: 10;
+}
+
+button {
+  padding: 8px 12px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+#canvasWrap {
+  width: 100vw;
+  height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -26,152 +38,132 @@ html, body {
 
 canvas {
   image-rendering: pixelated;
-  background: black;
-}
-
-#controls {
-  text-align: center;
-  padding: 8px;
-  background: #111;
-}
-
-button, select {
-  margin: 4px;
-  padding: 8px 12px;
-  font-size: 14px;
+  max-width: 100%;
+  max-height: 100%;
 }
 </style>
 </head>
 
 <body>
-<div id="root">
-  <div id="screen-wrap"></div>
-
-  <div id="controls">
-    <button id="connect">Connect</button>
-    <button id="shot" disabled>Screenshot</button>
-    <button id="record" disabled>Record</button>
-
-    <select id="scale">
-      <option value="1">1×</option>
-      <option value="2" selected>2×</option>
-      <option value="3">3×</option>
-      <option value="4">4×</option>
-      <option value="5">5×</option>
-    </select>
-
-    <button id="hide">Hide Buttons</button>
-  </div>
+<div id="ui">
+  <button id="connect">Connect</button>
+  <button id="shot">Screenshot</button>
+  <button id="record">Record</button>
+  <button id="hide">Hide UI</button>
 </div>
 
-<script src="TIVarsLib.js"></script>
-<script>
-let canvas, ctx;
-let recorder, chunks = [];
-let recording = false;
+<div id="canvasWrap">
+  <canvas id="screen" width="320" height="240"></canvas>
+</div>
+
+<script type="module">
+import TIVarsLib from "./TIVarsLib.js";
+
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+const img = ctx.createImageData(320, 240);
+
+let Module;
 let connected = false;
-let scale = 2;
+let recording = false;
+let recorder;
+let recordChunks = [];
 
-/* Create canvas */
-canvas = document.createElement("canvas");
-canvas.width = 320;
-canvas.height = 240;
-applyScale();
+const TI_USB_FILTERS = [
+  { vendorId: 0x0451 } // Texas Instruments
+];
 
-ctx = canvas.getContext("2d");
-document.getElementById("screen-wrap").appendChild(canvas);
-
-/* Scaling */
-function applyScale() {
-  canvas.style.width  = (320 * scale) + "px";
-  canvas.style.height = (240 * scale) + "px";
+async function initWasm() {
+  Module = await TIVarsLib({
+    locateFile: p => p
+  });
+  await Module.ready;
+  console.log("WASM ready");
+  alert("WASM ready")
 }
 
-document.getElementById("scale").onchange = e => {
-  scale = Number(e.target.value);
-  applyScale();
-};
+async function connectTI() {
+  if (connected) return;
 
-/* Connect */
-document.getElementById("connect").onclick = async () => {
-  if (!window.Module || !Module._ti_connect) {
-    alert("WASM not ready yet");
+  await navigator.usb.requestDevice({ filters: TI_USB_FILTERS });
+
+  const ok = Module._ti_connect();
+  if (!ok) {
+    alert("Failed to connect");
     return;
   }
 
-  try {
-    await Module._ti_connect();
-    connected = true;
+  connected = true;
+  loop();
+}
 
-    document.getElementById("shot").disabled = false;
-    document.getElementById("record").disabled = false;
-
-    setInterval(capture, 250);
-  } catch (e) {
-    alert("Connection failed");
-    console.error(e);
-  }
-};
-
-/* Screen capture */
-function capture() {
+function loop() {
   if (!connected) return;
 
-  Module._ti_read_screen();
-
   const ptr = Module._ti_get_screen_ptr();
-  const size = Module._ti_get_screen_size();
-  const mem = Module.HEAPU8.subarray(ptr, ptr + size);
+  const buf = Module.HEAPU8.subarray(ptr, ptr + 320 * 240 * 2);
 
-  const img = ctx.createImageData(320, 240);
+  let j = 0;
+  for (let i = 0; i < buf.length; i += 2) {
+    const rgb565 = buf[i] | (buf[i + 1] << 8);
+    const r = ((rgb565 >> 11) & 0x1F) * 255 / 31;
+    const g = ((rgb565 >> 5) & 0x3F) * 255 / 63;
+    const b = (rgb565 & 0x1F) * 255 / 31;
 
-  for (let i = 0, j = 0; i < mem.length; i += 2, j += 4) {
-    const v = mem[i] | (mem[i + 1] << 8);
-    img.data[j]     = ((v >> 11) & 31) << 3;
-    img.data[j + 1] = ((v >> 5)  & 63) << 2;
-    img.data[j + 2] = (v & 31) << 3;
-    img.data[j + 3] = 255;
+    img.data[j++] = r;
+    img.data[j++] = g;
+    img.data[j++] = b;
+    img.data[j++] = 255;
   }
 
   ctx.putImageData(img, 0, 0);
+  requestAnimationFrame(loop);
 }
 
-/* Screenshot */
+document.getElementById("connect").onclick = connectTI;
+
 document.getElementById("shot").onclick = () => {
   const a = document.createElement("a");
+  a.download = "ti-screen.png";
   a.href = canvas.toDataURL("image/png");
-  a.download = "ti-screenshot.png";
   a.click();
 };
 
-/* Record */
 document.getElementById("record").onclick = () => {
   if (!recording) {
-    const stream = canvas.captureStream(30);
+    const stream = canvas.captureStream(60);
     recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+    recordChunks = [];
 
-    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.ondataavailable = e => recordChunks.push(e.data);
     recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: "video/webm" });
+      const blob = new Blob(recordChunks, { type: "video/webm" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = "ti-recording.webm";
+      a.download = "ti-screen.webm";
       a.click();
-      chunks = [];
     };
 
     recorder.start();
     recording = true;
+    document.getElementById("record").textContent = "Stop";
   } else {
     recorder.stop();
     recording = false;
+    document.getElementById("record").textContent = "Record";
   }
 };
 
-/* Hide UI */
 document.getElementById("hide").onclick = () => {
-  document.getElementById("controls").remove();
+  document.getElementById("ui").style.display = "none";
 };
+
+navigator.usb.addEventListener("disconnect", () => {
+  connected = false;
+  setTimeout(connectTI, 1000);
+});
+
+initWasm();
 </script>
 </body>
 </html>
