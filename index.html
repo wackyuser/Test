@@ -55,7 +55,6 @@ canvas {
 <div id="canvasWrap">
   <canvas id="screen" width="320" height="240"></canvas>
 </div>
-
 <script type="module">
 import TIVarsLib from "./TIVarsLib.js";
 
@@ -69,88 +68,129 @@ let recording = false;
 let recorder;
 let recordChunks = [];
 
-const TI_USB_FILTERS = [
-  { vendorId: 0x0451 } // Texas Instruments
-];
+function fatal(msg, err) {
+  console.error(msg, err || "");
+  alert(msg + (err ? "\n\n" + err : ""));
+}
 
 async function initWasm() {
-  Module = await TIVarsLib({
-    locateFile: p => p
-  });
-  await Module.ready;
-  console.log("WASM ready");
-  alert("WASM ready")
+  try {
+    Module = await TIVarsLib({
+      locateFile: p => p
+    });
+    await Module.ready;
+    console.log("WASM ready");
+    alert("WASM Ready")
+  } catch (e) {
+    fatal("Failed to initialize WASM", e);
+  }
 }
 
 async function connectTI() {
-  if (connected) return;
+  try {
+    if (!Module) {
+      fatal("WASM not loaded yet");
+      return;
+    }
 
-  await navigator.usb.requestDevice({ filters: TI_USB_FILTERS });
+    await navigator.usb.requestDevice({
+      filters: [{ vendorId: 0x0451 }]
+    });
 
-  const ok = Module._ti_connect();
-  if (!ok) {
-    alert("Failed to connect");
-    return;
+    const ok = Module._ti_connect();
+    if (!ok) {
+      fatal("TI connection failed");
+      return;
+    }
+
+    connected = true;
+    console.log("TI connected");
+    requestAnimationFrame(loop);
+
+  } catch (e) {
+    fatal("USB connection error", e);
   }
-
-  connected = true;
-  loop();
 }
 
 function loop() {
   if (!connected) return;
 
-  const ptr = Module._ti_get_screen_ptr();
-  const buf = Module.HEAPU8.subarray(ptr, ptr + 320 * 240 * 2);
+  try {
+    Module._ti_read_screen();
 
-  let j = 0;
-  for (let i = 0; i < buf.length; i += 2) {
-    const rgb565 = buf[i] | (buf[i + 1] << 8);
-    const r = ((rgb565 >> 11) & 0x1F) * 255 / 31;
-    const g = ((rgb565 >> 5) & 0x3F) * 255 / 63;
-    const b = (rgb565 & 0x1F) * 255 / 31;
+    const ptr = Module._ti_get_screen_ptr();
+    const size = Module._ti_get_screen_size();
 
-    img.data[j++] = r;
-    img.data[j++] = g;
-    img.data[j++] = b;
-    img.data[j++] = 255;
+    if (!ptr || size !== 320 * 240 * 2) {
+      fatal("Invalid screen buffer", { ptr, size });
+      connected = false;
+      return;
+    }
+
+    const buf = Module.HEAPU8.subarray(ptr, ptr + size);
+
+    let j = 0;
+    for (let i = 0; i < buf.length; i += 2) {
+      const v = buf[i] | (buf[i + 1] << 8);
+
+      img.data[j++] = ((v >> 11) & 31) * 255 / 31;
+      img.data[j++] = ((v >> 5) & 63) * 255 / 63;
+      img.data[j++] = (v & 31) * 255 / 31;
+      img.data[j++] = 255;
+    }
+
+    ctx.putImageData(img, 0, 0);
+
+  } catch (e) {
+    fatal("Screen read failed", e);
+    connected = false;
+    return;
   }
 
-  ctx.putImageData(img, 0, 0);
   requestAnimationFrame(loop);
 }
+
+/* UI */
 
 document.getElementById("connect").onclick = connectTI;
 
 document.getElementById("shot").onclick = () => {
-  const a = document.createElement("a");
-  a.download = "ti-screen.png";
-  a.href = canvas.toDataURL("image/png");
-  a.click();
+  try {
+    const a = document.createElement("a");
+    a.download = "ti-screen.png";
+    a.href = canvas.toDataURL("image/png");
+    a.click();
+  } catch (e) {
+    fatal("Screenshot failed", e);
+  }
 };
 
 document.getElementById("record").onclick = () => {
-  if (!recording) {
-    const stream = canvas.captureStream(60);
-    recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
-    recordChunks = [];
+  try {
+    if (!recording) {
+      const stream = canvas.captureStream(60);
+      recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+      recordChunks = [];
 
-    recorder.ondataavailable = e => recordChunks.push(e.data);
-    recorder.onstop = () => {
-      const blob = new Blob(recordChunks, { type: "video/webm" });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = "ti-screen.webm";
-      a.click();
-    };
+      recorder.ondataavailable = e => recordChunks.push(e.data);
+      recorder.onstop = () => {
+        const blob = new Blob(recordChunks, { type: "video/webm" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "ti-screen.webm";
+        a.click();
+      };
 
-    recorder.start();
-    recording = true;
-    document.getElementById("record").textContent = "Stop";
-  } else {
-    recorder.stop();
-    recording = false;
-    document.getElementById("record").textContent = "Record";
+      recorder.start();
+      recording = true;
+      document.getElementById("record").textContent = "Stop";
+    } else {
+      recorder.stop();
+      recording = false;
+      document.getElementById("record").textContent = "Record";
+    }
+  } catch (e) {
+    fatal("Recording error", e);
   }
 };
 
@@ -160,7 +200,7 @@ document.getElementById("hide").onclick = () => {
 
 navigator.usb.addEventListener("disconnect", () => {
   connected = false;
-  setTimeout(connectTI, 1000);
+  alert("Calculator disconnected");
 });
 
 initWasm();
