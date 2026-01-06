@@ -1,36 +1,178 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Basic Page</title>
-  <!-- Optional: add your stylesheet at styles.css -->
-  <link rel="stylesheet" href="styles.css" />
+<meta charset="UTF-8">
+<title>TI Screen</title>
+
+<style>
+html, body {
+  margin: 0;
+  height: 100%;
+  background: black;
+}
+
+#root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+#screen-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+canvas {
+  image-rendering: pixelated;
+  background: black;
+}
+
+#controls {
+  text-align: center;
+  padding: 8px;
+  background: #111;
+}
+
+button, select {
+  margin: 4px;
+  padding: 8px 12px;
+  font-size: 14px;
+}
+</style>
 </head>
+
 <body>
-  <header>
-    <h1>Welcome to the Basic Page</h1>
-  </header>
+<div id="root">
+  <div id="screen-wrap"></div>
 
-  <main>
-    <p>This is a simple HTML file created as a starting point.</p>
+  <div id="controls">
+    <button id="connect">Connect</button>
+    <button id="shot" disabled>Screenshot</button>
+    <button id="record" disabled>Record</button>
 
-    <section>
-      <h2>Example</h2>
-      <p>Modify this content to suit your project.</p>
-      <button id="greet">Click me</button>
-    </section>
-  </main>
+    <select id="scale">
+      <option value="1">1×</option>
+      <option value="2" selected>2×</option>
+      <option value="3">3×</option>
+      <option value="4">4×</option>
+      <option value="5">5×</option>
+    </select>
 
-  <footer>
-    <small>© 2026 Your Project</small>
-  </footer>
+    <button id="hide">Hide Buttons</button>
+  </div>
+</div>
 
-  <script>
-    // Small interaction to verify JS is working
-    document.getElementById('greet').addEventListener('click', function () {
-      alert('Hello — your basic HTML page is working!');
-    });
-  </script>
+<script src="tivars.js"></script>
+<script>
+let canvas, ctx;
+let recorder, chunks = [];
+let recording = false;
+let connected = false;
+let scale = 2;
+
+/* Create canvas */
+canvas = document.createElement("canvas");
+canvas.width = 320;
+canvas.height = 240;
+applyScale();
+
+ctx = canvas.getContext("2d");
+document.getElementById("screen-wrap").appendChild(canvas);
+
+/* Scaling */
+function applyScale() {
+  canvas.style.width  = (320 * scale) + "px";
+  canvas.style.height = (240 * scale) + "px";
+}
+
+document.getElementById("scale").onchange = e => {
+  scale = Number(e.target.value);
+  applyScale();
+};
+
+/* Connect */
+document.getElementById("connect").onclick = async () => {
+  if (!window.Module || !Module._ti_connect) {
+    alert("WASM not ready yet");
+    return;
+  }
+
+  try {
+    await Module._ti_connect();
+    connected = true;
+
+    document.getElementById("shot").disabled = false;
+    document.getElementById("record").disabled = false;
+
+    setInterval(capture, 250);
+  } catch (e) {
+    alert("Connection failed");
+    console.error(e);
+  }
+};
+
+/* Screen capture */
+function capture() {
+  if (!connected) return;
+
+  Module._ti_read_screen();
+
+  const ptr = Module._ti_get_screen_ptr();
+  const size = Module._ti_get_screen_size();
+  const mem = Module.HEAPU8.subarray(ptr, ptr + size);
+
+  const img = ctx.createImageData(320, 240);
+
+  for (let i = 0, j = 0; i < mem.length; i += 2, j += 4) {
+    const v = mem[i] | (mem[i + 1] << 8);
+    img.data[j]     = ((v >> 11) & 31) << 3;
+    img.data[j + 1] = ((v >> 5)  & 63) << 2;
+    img.data[j + 2] = (v & 31) << 3;
+    img.data[j + 3] = 255;
+  }
+
+  ctx.putImageData(img, 0, 0);
+}
+
+/* Screenshot */
+document.getElementById("shot").onclick = () => {
+  const a = document.createElement("a");
+  a.href = canvas.toDataURL("image/png");
+  a.download = "ti-screenshot.png";
+  a.click();
+};
+
+/* Record */
+document.getElementById("record").onclick = () => {
+  if (!recording) {
+    const stream = canvas.captureStream(30);
+    recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: "video/webm" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "ti-recording.webm";
+      a.click();
+      chunks = [];
+    };
+
+    recorder.start();
+    recording = true;
+  } else {
+    recorder.stop();
+    recording = false;
+  }
+};
+
+/* Hide UI */
+document.getElementById("hide").onclick = () => {
+  document.getElementById("controls").remove();
+};
+</script>
 </body>
 </html>
+
