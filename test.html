@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>TI-84 Plus CE Live Screen (Single-File WebUSB)</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#0b0b0d; color:#e8e8ee; }
+    header { padding: 12px; border-bottom: 1px solid #23232a; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    button, input { background:#17171c; color:#e8e8ee; border:1px solid #2b2b33; border-radius:12px; padding:10px 12px; font-size:14px; }
+    button { cursor:pointer; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .pill { padding:6px 10px; border-radius:999px; border:1px solid #2b2b33; background:#101014; font-size:12px; }
+    main { padding: 14px; display:grid; place-items:center; gap:12px; }
+    canvas { image-rendering: pixelated; border-radius:18px; border:1px solid #2b2b33; background:#000; width:min(96vw, 860px); height:auto; }
+    .muted { opacity:.8; font-size:12px; text-align:center; max-width: 980px; line-height:1.45; }
+    .row { display:flex; gap:10px; align-items:center; justify-content:center; flex-wrap:wrap; }
+  </style>
+</head>
+<body>
+  <header id="ui">
+    <button id="btnPair">Pair</button>
+    <button id="btnConnect" disabled>Connect</button>
+    <button id="btnStart" disabled>Start live</button>
+    <button id="btnStop" disabled>Stop</button>
+    <button id="btnShot" disabled>Screenshot</button>
+    <button id="btnHide">Hide UI</button>
+
+    <span class="pill" id="status">Idle</span>
+
+    <label class="pill">
+      FPS
+      <input id="fps" type="number" min="1" max="12" value="3" style="width:64px; margin-left:6px;" />
+    </label>
+  </header>
+
+  <main>
+    <canvas id="screen" width="320" height="240"></canvas>
+    <div class="muted">
+      This is “live” by polling the TI screen snapshot over USB (rapid screenshots). Desktop Chrome/Edge recommended.
+      If the calculator is busy, frames may drop or stall. Unplug/replug if it gets stuck.
+    </div>
+  </main>
+
+<script>
+/**
+ * TI-84 Plus CE single-file WebUSB live screen
+ * Implements:
+ *  - bulk endpoints discovery
+ *  - CARS fragmentation negotiation
+ *  - CARS greet (Exchange 1.0)
+ *  - CARS query for LCD + width/height/depth
+ *  - RGB565 decode + canvas render
+ *
+ * Notes:
+ *  - This is based on observed protocol structure used by TI Connect CE "CARS/Exchange".
+ *  - Live mode = repeated query snapshots.
+ */
+
+// ---------- UI ----------
+const ui = document.getElementById('ui');
+const statusEl = document.getElementById('status');
+const btnPair = document.getElementById('btnPair');
+const btnConnect = document.getElementById('btnConnect');
+const btnStart = document.getElementById('btnStart');
+const btnStop = document.getElementById('btnStop');
+const btnShot = document.getElementById('btnShot');
+const btnHide = document.getElementById('btnHide');
+const fpsEl = document.getElementById('fps');
+
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d', { alpha: false });
+
+function setStatus(s) { statusEl.textContent = s; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ---------- Protocol constants ----------
+const TI_VID = 0x0451;
+const TI_PIDS = [0xE003, 0xE008]; // 57347, 57352
+
+// Fragmentation packet IDs
+const FRAG_SIZE_NEGOTIATION = 1;
+const FRAG_SIZE_NEGOTIATION_RESPONSE = 2;
+const FRAG_DATA = 3;
+const FRAG_LAST_DATA = 4;
+const FRAG_ACK = 5;
+
+const ERR_FRAGMENTATION_ACK = 0xE000;
+
+const FRAG_HDR_SIZE = 5; // u32 payloadLen BE + u8 fragId
+const CARS_HDR_SIZE = 6; // u32 payloadLen BE + u16 packetId BE
+
+// CARS packet IDs
+const PKT_GREET = 1;
+const PKT_GREET_RESPONSE = 18;
+const PKT_QUERY = 7;
+const PKT_QUERY_RESPONSE = 8;
+const PKT_ERROR = 6;
+const PKT_WAIT = 5;
+
+// Exchange protocol ID
+const PROTO_EXCHANGE = 3;
+
+// Attributes
+const ATTR_LCD = 8;
+const ATTR_PIXEL_DEPTH = 29;
+const ATTR_NUM_HPIX = 30;
+const ATTR_NUM_VPIX = 31;
+
+const ATTR_STATUS_OK = 0;
+
+// ---------- Helpers ----------
+function beU16(buf, off) { return (buf[off] << 8) | buf[off+1]; }
+function beU32(buf, off) { return (buf[off] * 0x1000000) + (buf[off+1] << 16) + (buf[off+2] << 8) + buf[off+3]; }
+
+function packBE16(n) { return new Uint8Array([(n >> 8) & 255, n & 255]); }
+function packBE32(n) { return new Uint8Array([(n>>>24)&255, (n>>>16)&255, (n>>>8)&255, n&255]); }
+
+function concatBytes(...parts) {
+  let len = 0;
+  for (const p of parts) len += p.length;
+  const out = new Uint8Array(len);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+function buildCarsPacket(packetId, payload) {
+  return concatBytes(packBE32(payload.length), packBE16(packetId), payload);
+}
+
+// RGB565 -> RGBA (assumes little-endian pixels: low byte first)
+function rgb565ToRgba(raw, w, h) {
+  const expected = w * h * 2;
+  if (raw.length < expected) throw new Error(`LCD buffer too short: got ${raw.length}, need ${expected}`);
+  const out = new Uint8ClampedArray(w * h * 4);
+
+  let oi = 0;
+  for (let i = 0; i < expected; i += 2) {
+    const v = raw[i] | (raw[i+1] << 8); // little endian
+    const r = (v >> 11) & 0x1F;
+    const g = (v >> 5) & 0x3F;
+    const b = v & 0x1F;
+
+    const rr = (r << 3) | (r >> 2);
+    const gg = (g << 2) | (g >> 4);
+    const bb = (b << 3) | (b >> 2);
+
+    out[oi++] = rr;
+    out[oi++] = gg;
+    out[oi++] = bb;
+    out[oi++] = 255;
+  }
+  return out;
+}
+
+function drawRgba(rgba, w, h) {
+  canvas.width = w;
+  canvas.height = h;
+  const id = new ImageData(rgba, w, h);
+  ctx.putImageData(id, 0, 0);
+}
+
+function downloadCanvasPng() {
+  const a = document.createElement('a');
+  a.download = `ti_screen_${Date.now()}.png`;
+  a.href = canvas.toDataURL('image/png');
+  a.click();
+}
+
+// ---------- WebUSB transport ----------
+let device = null;
+let ifaceNumber = null;
+let epIn = null;
+let epOut = null;
+let fragSize = 0; // negotiated (total packet size); payload max = fragSize - FRAG_HDR_SIZE
+
+async function pairDevice() {
+  if (!('usb' in navigator)) throw new Error('WebUSB not supported in this browser.');
+
+  const filters = [
+    { vendorId: TI_VID },
+  ];
+
+  device = await navigator.usb.requestDevice({ filters });
+  setStatus('Paired (not opened)');
+  btnConnect.disabled = false;
+}
+
+async function openDevice() {
+  if (!device) throw new Error('No device paired.');
+
+  await device.open();
+
+  if (device.configuration === null) {
+    await device.selectConfiguration(1);
+  }
+
+  // Find an interface with bulk IN and bulk OUT endpoints
+  const cfg = device.configuration;
+  let found = null;
+
+  for (const iface of cfg.interfaces) {
+    for (const alt of iface.alternates) {
+      if (!alt.endpoints || alt.endpoints.length === 0) continue;
+      const bulkIn = alt.endpoints.find(e => e.direction === 'in' && e.type === 'bulk');
+      const bulkOut = alt.endpoints.find(e => e.direction === 'out' && e.type === 'bulk');
+      if (bulkIn && bulkOut) {
+        found = { ifaceNumber: iface.interfaceNumber, altSetting: alt.alternateSetting, bulkIn, bulkOut };
+        break;
+      }
+    }
+    if (found) break;
+  }
+
+  if (!found) throw new Error('Could not find bulk IN/OUT endpoints.');
+
+  ifaceNumber = found.ifaceNumber;
+  epIn = found.bulkIn.endpointNumber;
+  epOut = found.bulkOut.endpointNumber;
+
+  await device.claimInterface(ifaceNumber);
+
+  // If needed: select alternate setting
+  // (Usually alt 0 already)
+  // await device.selectAlternateInterface(ifaceNumber, found.altSetting);
+
+  setStatus('Connected (USB opened)');
+  btnStart.disabled = false;
+  btnShot.disabled = false;
+
+  // Negotiate fragmentation + greet immediately
+  await negotiateFragSize(1024);
+  await carsGreet(2000);
+  setStatus('Ready (greet OK)');
+}
+
+async function closeDevice() {
+  try {
+    if (device && device.opened) {
+      if (ifaceNumber !== null) {
+        try { await device.releaseInterface(ifaceNumber); } catch {}
+      }
+      await device.close();
+    }
+  } finally {
+    ifaceNumber = null; epIn = null; epOut = null;
+    fragSize = 0;
+  }
+}
+
+async function bulkWrite(bytes) {
+  const r = await device.transferOut(epOut, bytes);
+  if (r.status !== 'ok') throw new Error(`transferOut failed: ${r.status}`);
+}
+async function bulkRead(length, timeoutMs=2000) {
+  // WebUSB has no per-call timeout; browser handles it.
+  const r = await device.transferIn(epIn, length);
+  if (r.status !== 'ok') throw new Error(`transferIn failed: ${r.status}`);
+  return new Uint8Array(r.data.buffer);
+}
+
+// ---------- Fragment layer ----------
+async function sendFragPacket(fragId, payloadBytes) {
+  const pkt = concatBytes(packBE32(payloadBytes.length), new Uint8Array([fragId]), payloadBytes);
+  await bulkWrite(pkt);
+}
+
+async function recvFragPacket(maxRead = 2048) {
+  // Read a chunk. Sometimes the browser returns full packet; sometimes you might need to read again.
+  const first = await bulkRead(maxRead);
+  if (first.length < FRAG_HDR_SIZE) throw new Error('Fragment packet too short');
+
+  const plen = beU32(first, 0);
+  const fid = first[4];
+
+  let payload = first.slice(5);
+  if (payload.length > plen) payload = payload.slice(0, plen);
+
+  // If truncated, keep reading
+  while (payload.length < plen) {
+    const more = await bulkRead(plen - payload.length);
+    payload = concatBytes(payload, more);
+  }
+
+  return { fid, payload };
+}
+
+async function negotiateFragSize(preferred) {
+  setStatus('Negotiating fragment size…');
+  await sendFragPacket(FRAG_SIZE_NEGOTIATION, packBE32(preferred));
+
+  const { fid, payload } = await recvFragPacket();
+  if (fid !== FRAG_SIZE_NEGOTIATION_RESPONSE || payload.length < 4) {
+    throw new Error(`Bad frag negotiation response (id=${fid}, len=${payload.length})`);
+  }
+  fragSize = beU32(payload, 0);
+  if (fragSize < FRAG_HDR_SIZE + 64) throw new Error(`Negotiated fragment size too small: ${fragSize}`);
+}
+
+async function sendCarsPacketFragmented(carsPacketBytes) {
+  if (!fragSize) await negotiateFragSize(1024);
+
+  const maxPayload = fragSize - FRAG_HDR_SIZE;
+  let off = 0;
+
+  while (off < carsPacketBytes.length) {
+    const chunk = carsPacketBytes.slice(off, off + maxPayload);
+    off += chunk.length;
+
+    const last = off >= carsPacketBytes.length;
+    await sendFragPacket(last ? FRAG_LAST_DATA : FRAG_DATA, chunk);
+
+    const ack = await recvFragPacket();
+    if (ack.fid !== FRAG_ACK || ack.payload.length < 2) {
+      throw new Error(`Expected ACK, got id=${ack.fid} len=${ack.payload.length}`);
+    }
+    const code = beU16(ack.payload, 0);
+    if (code !== ERR_FRAGMENTATION_ACK) {
+      throw new Error(`Bad ACK code: 0x${code.toString(16)}`);
+    }
+  }
+}
+
+async function recvCarsPacketFragmented() {
+  if (!fragSize) await negotiateFragSize(1024);
+
+  let assembled = new Uint8Array(0);
+
+  while (true) {
+    const { fid, payload } = await recvFragPacket(fragSize + 256);
+    if (fid !== FRAG_DATA && fid !== FRAG_LAST_DATA) {
+      throw new Error(`Unexpected frag id=${fid}`);
+    }
+
+    assembled = concatBytes(assembled, payload);
+
+    // Send ACK
+    await sendFragPacket(FRAG_ACK, packBE16(ERR_FRAGMENTATION_ACK));
+
+    if (fid === FRAG_LAST_DATA) break;
+  }
+
+  return assembled;
+}
+
+// ---------- CARS protocol ----------
+function parseCarsHeader(pkt) {
+  if (pkt.length < CARS_HDR_SIZE) throw new Error('CARS packet too short');
+  const plen = beU32(pkt, 0);
+  const pid = beU16(pkt, 4);
+  if (pkt.length < CARS_HDR_SIZE + plen) throw new Error(`CARS truncated (have ${pkt.length}, need ${CARS_HDR_SIZE + plen})`);
+  return { plen, pid, payload: pkt.slice(CARS_HDR_SIZE, CARS_HDR_SIZE + plen) };
+}
+
+async function carsGreet(timeoutMs) {
+  // payload: protocolID(u16) major(u16) minor(u16) timeout(u32)
+  const payload = concatBytes(
+    packBE16(PROTO_EXCHANGE),
+    packBE16(1),
+    packBE16(0),
+    packBE32(timeoutMs >>> 0)
+  );
+  const pkt = buildCarsPacket(PKT_GREET, payload);
+
+  await sendCarsPacketFragmented(pkt);
+  const resp = await recvCarsPacketFragmented();
+  const h = parseCarsHeader(resp);
+
+  if (h.pid === PKT_ERROR) throw new Error('CARS ERROR during greet');
+  if (h.pid !== PKT_GREET_RESPONSE) throw new Error(`Unexpected greet response pid=${h.pid}`);
+}
+
+async function carsQueryScreen() {
+  // payload: [0, count=4] + 4x attribute(u16)
+  const attrs = [ATTR_NUM_HPIX, ATTR_NUM_VPIX, ATTR_PIXEL_DEPTH, ATTR_LCD];
+  let payload = new Uint8Array([0x00, 0x04]);
+  for (const a of attrs) payload = concatBytes(payload, packBE16(a));
+
+  const pkt = buildCarsPacket(PKT_QUERY, payload);
+  await sendCarsPacketFragmented(pkt);
+
+  const resp = await recvCarsPacketFragmented();
+  const h = parseCarsHeader(resp);
+
+  if (h.pid === PKT_WAIT) throw new Error('Device replied WAIT (try again)');
+  if (h.pid === PKT_ERROR) throw new Error('CARS ERROR during query');
+  if (h.pid !== PKT_QUERY_RESPONSE) throw new Error(`Unexpected query response pid=${h.pid}`);
+
+  return parseQueryAttributes(h.payload);
+}
+
+function parseQueryAttributes(payload) {
+  // payload:
+  // u16 count
+  // repeat count:
+  //   u16 attrId
+  //   u8 status
+  //   if status==0:
+  //      u16 len
+  //      bytes[len]
+  let off = 0;
+  if (payload.length < 2) throw new Error('Query payload too short');
+  const count = beU16(payload, off); off += 2;
+
+  let w = 320, h = 240, depth = 16;
+  let lcd = null;
+
+  for (let i = 0; i < count; i++) {
+    if (off + 3 > payload.length) throw new Error('Malformed attribute block');
+    const attrId = beU16(payload, off); off += 2;
+    const status = payload[off++];
+
+    if (status !== ATTR_STATUS_OK) throw new Error(`Attribute ${attrId} status=${status}`);
+
+    if (off + 2 > payload.length) throw new Error('Missing attribute length');
+    const vlen = beU16(payload, off); off += 2;
+    if (off + vlen > payload.length) throw new Error('Attribute overruns payload');
+
+    const val = payload.slice(off, off + vlen);
+    off += vlen;
+
+    if (attrId === ATTR_NUM_HPIX && vlen >= 2) w = beU16(val, 0);
+    else if (attrId === ATTR_NUM_VPIX && vlen >= 2) h = beU16(val, 0);
+    else if (attrId === ATTR_PIXEL_DEPTH && vlen >= 1) depth = val[0];
+    else if (attrId === ATTR_LCD) lcd = val;
+  }
+
+  return { w, h, depth, lcd };
+}
+
+// ---------- Live loop ----------
+let running = false;
+
+async function captureAndRender() {
+  const info = await carsQueryScreen();
+  if (!info.lcd) throw new Error('No LCD data returned');
+  if (info.depth !== 16) throw new Error(`Unsupported pixel depth: ${info.depth} (expected 16)`);
+
+  const rgba = rgb565ToRgba(info.lcd, info.w, info.h);
+  drawRgba(rgba, info.w, info.h);
+}
+
+async function startLive() {
+  if (running) return;
+  running = true;
+  btnStart.disabled = true;
+  btnStop.disabled = false;
+
+  while (running) {
+    const fps = Math.max(1, Math.min(12, parseInt(fpsEl.value || '3', 10)));
+    const delay = Math.floor(1000 / fps);
+    const t0 = performance.now();
+
+    try {
+      await captureAndRender();
+      setStatus(`Live (target ${fps} FPS)`);
+    } catch (e) {
+      console.error(e);
+      setStatus(`Error: ${e.message || e}`);
+      // backoff so we don't hammer on error
+      await sleep(500);
+    }
+
+    const dt = performance.now() - t0;
+    const wait = Math.max(0, delay - dt);
+    await sleep(wait);
+  }
+}
+
+function stopLive() {
+  running = false;
+  btnStart.disabled = false;
+  btnStop.disabled = true;
+  setStatus('Stopped');
+}
+
+// ---------- Wiring ----------
+btnPair.addEventListener('click', async () => {
+  try {
+    setStatus('Pairing…');
+    await pairDevice();
+  } catch (e) {
+    console.error(e);
+    setStatus(`Pair failed: ${e.message || e}`);
+  }
+});
+
+btnConnect.addEventListener('click', async () => {
+  try {
+    btnConnect.disabled = true;
+    setStatus('Connecting…');
+    await openDevice();
+  } catch (e) {
+    console.error(e);
+    setStatus(`Connect failed: ${e.message || e}`);
+    btnConnect.disabled = false;
+  }
+});
+
+btnStart.addEventListener('click', () => startLive());
+btnStop.addEventListener('click', () => stopLive());
+
+btnShot.addEventListener('click', async () => {
+  try {
+    setStatus('Capturing…');
+    await captureAndRender();
+    downloadCanvasPng();
+    setStatus('Screenshot saved');
+  } catch (e) {
+    console.error(e);
+    setStatus(`Screenshot failed: ${e.message || e}`);
+  }
+});
+
+btnHide.addEventListener('click', () => {
+  ui.style.display = 'none';
+});
+
+// Clean up on unload
+window.addEventListener('beforeunload', async () => {
+  try { stopLive(); } catch {}
+  try { await closeDevice(); } catch {}
+});
+</script>
+</body>
+</html>
